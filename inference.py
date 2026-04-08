@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 from openai import OpenAI
@@ -21,6 +21,18 @@ from dotenv import load_dotenv
 
 # -- Configuration -----------------------------------------------------------
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
+
+# IMPORTANT: Evaluators often parse stdout. Keep stdout restricted to:
+#   [START] ...
+#   [STEP]  ...
+#   [END]   ...
+# Route any diagnostics to stderr.
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
+
+def _dprint(msg: str) -> None:
+    if DEBUG:
+        print(msg, file=sys.stderr, flush=True)
 
 # Competition-required env vars (with backward-compatible fallbacks)
 API_BASE_URL = (
@@ -51,6 +63,10 @@ ENV_URL = (
     os.environ.get("ENV_URL") or "http://localhost:7860"
 ).strip().strip('"').strip("'")
 
+# Sample-style metadata
+BENCHMARK = os.getenv("BENCHMARK", "ml-audit-bench")
+TASK_NAME = os.getenv("TASK_NAME") or os.getenv("TASK_FILTER") or "easy"
+
 TEMPERATURE = 0.0
 MAX_TOKENS = 800
 MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
@@ -58,6 +74,8 @@ REQUEST_TIMEOUT = 30
 RETRY_DELAYS = [2, 4, 8]
 TASK_FILTER = os.getenv("TASK_FILTER", None)
 MAX_EPISODES = int(os.getenv("MAX_EPISODES", "3"))
+
+SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.1"))
 
 ARTIFACT_TRUNCATION = {
     "split_config": 4000,
@@ -202,7 +220,7 @@ if not SYSTEM_PROMPT and SYSTEM_PROMPT_FILE:
     try:
         SYSTEM_PROMPT = Path(SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"WARN: Failed to read SYSTEM_PROMPT_FILE ({SYSTEM_PROMPT_FILE}): {exc}")
+        _dprint(f"WARN: Failed to read SYSTEM_PROMPT_FILE ({SYSTEM_PROMPT_FILE}): {exc}")
 
 if not SYSTEM_PROMPT:
     SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
@@ -221,7 +239,7 @@ def _http(method, endpoint, **kwargs):
             if attempt < len(RETRY_DELAYS):
                 time.sleep(RETRY_DELAYS[attempt])
             else:
-                print(f"    ENV request failed: {exc}")
+                _dprint(f"ENV request failed: {exc}")
     return None
 
 
@@ -233,7 +251,7 @@ def env_request(method, endpoint, **kwargs):
         resp.raise_for_status()
         return resp.json()
     except (requests.RequestException, ValueError) as exc:
-        print(f"    ENV error: {exc}")
+        _dprint(f"ENV error: {exc}")
     return None
 
 
@@ -262,7 +280,7 @@ def llm_call(client, messages):
             if attempt < len(RETRY_DELAYS):
                 time.sleep(RETRY_DELAYS[attempt])
             else:
-                print(f"    LLM failed: {err[:120]}")
+                _dprint(f"LLM failed: {err[:200]}")
     return ""
 
 
@@ -272,7 +290,7 @@ def maybe_add_compare_hint(inspected_set, hint_configs, already_hinted):
         key = cfg["violation"]
         if key not in already_hinted and cfg["artifacts"].issubset(inspected_set):
             already_hinted.add(key)
-            print(f"[HINT] Compare hint injected for {cfg['violation']} after inspecting {sorted(inspected_set)}")
+            _dprint(f"Compare hint injected for {cfg['violation']} after inspecting {sorted(inspected_set)}")
             return cfg["hint"]
     return None
 
@@ -413,17 +431,49 @@ def _format_action_single_line(action: dict) -> str:
     return json.dumps(action, separators=(',', ':'))
 
 
+def _clamp01(x: Any) -> float:
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    if xf < 0.0:
+        return 0.0
+    if xf > 1.0:
+        return 1.0
+    return xf
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    err_val = error if error else "null"
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={err_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards) if rewards else "0.00"
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={_clamp01(score):.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
 def run_episode(client, task, seed=SEED):
     """
     Run a single episode with competition-required [START]/[STEP]/[END] stdout format.
     """
-    step_rewards = []
-    final_score = 0.0
-    total_steps = 0
+    step_rewards: list[float] = []
+    score = 0.0
+    steps_taken = 0
+    success = False
     response_text = ""  # ensure always defined
 
-    # [START] line - emitted at episode begin
-    print(f"[START] task={task} env=ml-audit-bench model={MODEL_NAME}", flush=True)
+    log_start(task=task, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         # Reset with seed, fallback to unseeded
@@ -431,12 +481,12 @@ def run_episode(client, task, seed=SEED):
         if reset_data is None:
             reset_data = env_request("POST", "/reset", params={"task": task})
         if reset_data is None or not isinstance(reset_data, dict):
-            print("  ERROR: Failed to reset or received invalid response")
+            _dprint("Failed to reset or received invalid response")
             return 0.0
 
         obs = reset_data.get("observation", reset_data)
         if not isinstance(obs, dict):
-            print("  ERROR: Invalid observation format")
+            _dprint("Invalid observation format")
             return 0.0
         
         cache = {}
@@ -446,9 +496,12 @@ def run_episode(client, task, seed=SEED):
         pending_hints = []
         pending_compare_overrides = []
 
-        for step_num in range(MAX_STEPS):
-            ctx = build_context(obs, step_num, cache)
-            state_summary = build_state_summary(obs, step_num)
+        budget = int(obs.get("step_budget", MAX_STEPS))
+        budget = max(1, min(budget, MAX_STEPS))
+
+        for step_num in range(1, budget + 1):
+            ctx = build_context(obs, step_num - 1, cache)
+            state_summary = build_state_summary(obs, step_num - 1)
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             for act_msg, res_msg in history[-2:]:
                 messages.append({"role": "assistant", "content": act_msg})
@@ -472,7 +525,7 @@ def run_episode(client, task, seed=SEED):
 
             if action is None:
                 invalid_streak += 1
-                print(f"    Invalid JSON ({invalid_streak}): {response_text[:80]}")
+                _dprint(f"Invalid JSON ({invalid_streak}): {response_text[:120]}")
                 available = obs.get("available_artifacts", [])
                 inspected = set(obs.get("inspected_artifacts", []))
                 remaining = [a for a in available if a not in inspected]
@@ -528,41 +581,39 @@ def run_episode(client, task, seed=SEED):
                 ):
                     action = {"type": "compare", "artifact_a": "validation_strategy", "artifact_b": "eval_report"}
 
-            atype = action.get("type", "?")
-            detail = action.get("artifact") or action.get("violation_type") or action.get("verdict", "")
-            print(f"  Step {step_num+1:2d}: {atype:<10} {detail}")
+            # Budget guard: end cleanly on final allowed step.
+            if step_num == budget and action.get("type") != "submit":
+                action = {"type": "submit", "verdict": "pass", "summary": "budget_end"}
 
             result = env_request("POST", "/step", json={"action": action})
             if result is None:
                 result = env_request("POST", "/step",
                     json={"action": {"type": "submit", "verdict": "reject", "summary": "env_error"}})
                 if result is None or not isinstance(result, dict):
-                    print("  ERROR: Step request failed")
+                    _dprint("Step request failed")
                     return 0.0
 
             obs = result.get("observation", result)
             if not isinstance(obs, dict):
-                print("  ERROR: Invalid observation in step response")
+                _dprint("Invalid observation in step response")
                 return 0.0
             
             reward = result.get("reward", 0.0)
             done = result.get("done", False)
-            error_str = obs.get("last_action_error") or "null"
-            total_steps = step_num + 1
-            step_rewards.append(reward)
+            error_str = obs.get("last_action_error")
+            steps_taken = step_num
+            try:
+                step_rewards.append(float(reward or 0.0))
+            except (TypeError, ValueError):
+                step_rewards.append(0.0)
 
             # [STEP] line - emitted after each env.step()
             action_str = _format_action_single_line(action)
-            print(
-                f"[STEP] step={total_steps} "
-                f"action={action_str} "
-                f"reward={reward:.2f} "
-                f"done={str(done).lower()} "
-                f"error={error_str}",
-                flush=True
-            )
-
-            print(f"           reward={reward:+.3f} done={done}")
+            try:
+                reward_f = float(reward or 0.0)
+            except (TypeError, ValueError):
+                reward_f = 0.0
+            log_step(step=steps_taken, action=action_str, reward=reward_f, done=bool(done), error=error_str)
 
             # Cache artifacts for evidence quoting
             if action.get("type") == "inspect" and not obs.get("last_action_error"):
@@ -583,134 +634,36 @@ def run_episode(client, task, seed=SEED):
             inspected_set = set(obs.get("inspected_artifacts", []) or [])
             compare_hint = maybe_add_compare_hint(inspected_set, COMPARE_HINTS, already_hinted)
             if compare_hint:
-                print("           hint=compare-suggested")
                 pending_hints.append(compare_hint)
                 pending_compare_overrides.append(_hint_to_compare_action(compare_hint))
 
             if done:
                 try:
-                    final_score = float(result.get("info", {}).get("score", 0.0)) if isinstance(result, dict) else 0.0
+                    score = _clamp01(result.get("info", {}).get("score", 0.0)) if isinstance(result, dict) else 0.0
                 except (ValueError, TypeError, AttributeError):
-                    final_score = 0.0
-                print(f"  Done. Score: {final_score:.4f}")
-                return final_score
+                    score = 0.0
+                success = score >= SUCCESS_SCORE_THRESHOLD
+                return float(score)
 
-        print("  Max steps; forcing submit")
-        em = env_request("POST", "/step",
-            json={"action": {"type": "submit", "verdict": "pass", "summary": "max_steps"}})
-        if em and isinstance(em, dict):
-            try:
-                final_score = float(em.get("info", {}).get("score", 0.0))
-                total_steps += 1
-                step_rewards.append(em.get("reward", 0.0))
-            except (ValueError, TypeError, AttributeError):
-                final_score = 0.0
-        return final_score
+        # If we exhausted budget without a done=True response, we still emit [END]
+        # with score=0.0 (conservative) and success=false.
+        return float(score)
 
     finally:
-        # [END] line - ALWAYS emitted, even on exception
-        success = final_score > 0.0
-        reward_list = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
-        print(
-            f"[END] success={str(success).lower()} "
-            f"steps={total_steps} "
-            f"rewards={reward_list}",
-            flush=True
-        )
+        # Always attempt to close server-side episode (best-effort)
+        try:
+            env_request("POST", "/close")
+        except Exception as exc:
+            _dprint(f"/close failed: {exc}")
+        log_end(success=success, steps=steps_taken, score=score, rewards=step_rewards)
 
 
 # -- Main --------------------------------------------------------------------
 
 def main():
-    try:
-        print("=" * 60)
-        print("  ML Experiment Integrity Auditor - Baseline v4.0")
-        print("=" * 60)
-
-        missing = []
-        if not API_BASE_URL: missing.append("API_BASE_URL")
-        if not MODEL_NAME:   missing.append("MODEL_NAME")
-        if not API_KEY:      missing.append("HF_TOKEN or OPENAI_API_KEY")
-        if missing:
-            print(f"ERROR: Missing required env vars: {', '.join(missing)}")
-            print("Set API_BASE_URL, MODEL_NAME, and HF_TOKEN before running.")
-            sys.exit(1)
-
-        masked = API_KEY[:8] + "***" + API_KEY[-4:] if len(API_KEY) > 12 else "???"
-        print(f"  API_BASE_URL = {API_BASE_URL}")
-        print(f"  MODEL_NAME   = {MODEL_NAME}")
-        print(f"  API_KEY      = {masked}")
-        print(f"  ENV_URL      = {ENV_URL}")
-        print()
-
-        health = env_request("GET", "/health")
-        if health is None:
-            print(f"ERROR: Cannot reach environment at {ENV_URL}/health")
-            print("Make sure the Docker container is running on port 7860.")
-            sys.exit(1)
-        print(f"Environment: {health}")
-
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-        print("Testing LLM...")
-        try:
-            test_resp = llm_call(client, [{"role": "user", "content": 'Say "OK"'}])
-            print(f"  OK: {(test_resp or '').strip()[:20]}")
-        except Exception as exc:
-            print(f"  LLM test failed: {str(exc)[:120]}")
-            print("  Continuing anyway...")
-        print()
-
-        start = time.time()
-        tasks = ["easy", "medium", "hard"]
-        if TASK_FILTER:
-            if TASK_FILTER not in tasks:
-                print(f"ERROR: Invalid TASK_FILTER='{TASK_FILTER}'. Use easy|medium|hard"); sys.exit(1)
-            tasks = [TASK_FILTER]
-
-        scores = {}
-        for task in tasks:
-            print("-" * 60)
-            print(f"  Task: {task.upper()} (episodes={MAX_EPISODES}, seed_base={SEED})")
-            print("-" * 60)
-            try:
-                task_scores = []
-                for episode_idx in range(MAX_EPISODES):
-                    episode_seed = SEED + episode_idx
-                    print(f"  Episode {episode_idx + 1}/{MAX_EPISODES} (seed={episode_seed})")
-                    task_scores.append(run_episode(client, task, episode_seed))
-                scores[task] = sum(task_scores) / len(task_scores) if task_scores else 0.0
-            except Exception as exc:
-                print(f"  ERROR: {exc}"); scores[task] = 0.0
-            print()
-
-        elapsed = time.time() - start
-        avg = sum(scores.values()) / len(scores) if scores else 0.0
-        summary = {
-            "easy": round(scores.get("easy", 0.0), 4),
-            "medium": round(scores.get("medium", 0.0), 4),
-            "hard": round(scores.get("hard", 0.0), 4),
-            "average": round(avg, 4),
-            "runtime_seconds": round(elapsed, 1),
-        }
-        print("=" * 60)
-        print(f"easy:    {summary['easy']:.4f}")
-        print(f"medium:  {summary['medium']:.4f}")
-        print(f"hard:    {summary['hard']:.4f}")
-        print(f"average: {summary['average']:.4f}")
-        print(f"runtime: {summary['runtime_seconds']:.1f}s")
-        print("=" * 60)
-        print(json.dumps(summary))
-    
-    except SystemExit:
-        # Allow sys.exit() calls to propagate
-        raise
-    except Exception as exc:
-        # Catch any unhandled exceptions and exit gracefully
-        print(f"\n[ERROR] Unhandled exception: {exc}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+    # Keep stdout limited to the required [START]/[STEP]/[END] lines.
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    run_episode(client, TASK_NAME, seed=SEED)
 
 
 if __name__ == "__main__":
